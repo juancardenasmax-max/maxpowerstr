@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse, asyncio, csv, dataclasses, json, logging, math, os, random, re, threading, time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse
@@ -464,30 +465,69 @@ def kbb_model_base_url(make: str, model_slug: str, year: int) -> str:
     slug = (model_slug or "").strip().lower()
     return f"https://www.kbb.com/motorcycles/{mk}/{slug}/{int(year)}/"
 
+def kbb_normalize_model_slug(slug: str) -> str:
+    """
+    Normalize slugs that erroneously include style-only suffixes.
+    We conservatively strip base-only markers; do NOT strip '-abs' here because some makes
+    represent ABS as a separate model in certain years. We do strip obvious 'base' variants.
+    """
+    s = (slug or '').lower().strip('-')
+    for suf in ("-base-style", "-base", "-standard", "-std"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            s = s.strip('-')
+    return s
+
+# ------------------------------ KBB navigation reliability ------------------------------
+def _goto_with_retries(mgr: BrowserMgr, url: str, *, waits=("networkidle","domcontentloaded"), retries: int = 2, pause_ms: int = 250) -> bool:
+    """Navigate with a couple of attempts and different wait strategies.
+    Falls back from networkidle to domcontentloaded to avoid hangs on quiet pages.
+    Also recycles the browser if a block page is detected.
+    """
+    for attempt in range(max(1, retries)):
+        for w in (list(waits) or ["domcontentloaded"]):
+            ok = mgr.goto(url, wait=w)
+            P(mgr).wait_for_timeout(pause_ms)
+            if not ok:
+                continue
+            try:
+                if mgr.looks_blocked():
+                    LOG.warning(f"KBB: block/anti-bot page detected during nav to {url}; recycling…")
+                    time.sleep(3)
+                    mgr.recycle()
+                    continue
+            except Exception:
+                pass
+            return True
+        # brief backoff then retry
+        P(mgr).wait_for_timeout(min(1200, 300 + attempt * 300))
+    return False
+
 def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int) -> Dict[str, Optional[int]]:
     out: Dict[str, Optional[int]] = {"trade_in": None, "retail": None}
     base = kbb_model_base_url(make, model_slug, year)
     # Trade-In
     try:
-        url_t = base + "?pricetype=trade-in"
+        # Use explicit trade-in parameter (no hyphen) and include vehicle class
+        url_t = base + "?pricetype=tradein&vehicleclass=motorcycles"
         P(mgr).wait_for_timeout(detail_pause_ms//2 if detail_pause_ms else 400)
-        # Use networkidle to give React/GraphQL time to hydrate
-        if mgr.goto(url_t, wait="networkidle"):
+        # Try networkidle then domcontentloaded to avoid long hangs
+        if _goto_with_retries(mgr, url_t, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
             # Small settle time then extract
             P(mgr).wait_for_timeout(500)
             v = kbb_extract_values_from_page(mgr)
+            # Only trust trade-in value on the trade-in page
             if v.get("trade_in") is not None:
                 out["trade_in"] = v.get("trade_in")
-            if v.get("retail") is not None and out.get("retail") is None:
-                out["retail"] = v.get("retail")
     except Exception:
         pass
     # Retail
     try:
         if out.get("retail") is None:
+            # Typical Listing Price (aka retail)
             url_r = base + "?pricetype=retail&vehicleclass=motorcycles"
             P(mgr).wait_for_timeout(300)
-            if mgr.goto(url_r, wait="networkidle"):
+            if _goto_with_retries(mgr, url_r, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
                 P(mgr).wait_for_timeout(500)
                 v = kbb_extract_values_from_page(mgr)
                 if v.get("retail") is not None:
@@ -496,7 +536,85 @@ def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_sl
                     out["trade_in"] = v.get("trade_in")
     except Exception:
         pass
+    # Sanity: retail should not be lower than trade-in
+    try:
+        ti = out.get("trade_in"); rt = out.get("retail")
+        if isinstance(ti, int) and isinstance(rt, int) and ti > rt:
+            out["trade_in"], out["retail"] = rt, ti
+    except Exception:
+        pass
     return out
+
+def _kbb_fetch_prices_and_styles(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int) -> Tuple[Dict[str, Optional[int]], Dict[str, Dict[str, Optional[int]]]]:
+    """
+    Fetch base trade-in and retail for a model, plus per-style values when a style/trim select is present.
+    Returns (base_values, styles_map) where styles_map maps style label -> {'trade_in': int|None, 'retail': int|None}.
+    """
+    base_vals = _kbb_fetch_prices_via_params(mgr, year, make, model_slug, detail_pause_ms)
+    styles: Dict[str, Dict[str, Optional[int]]] = {}
+    try:
+        base = kbb_model_base_url(make, model_slug, year)
+        # Navigate to retail page (no trim) and enumerate style labels once
+        url_r_base = base + "?pricetype=retail&vehicleclass=motorcycles"
+        P(mgr).wait_for_timeout(250)
+        style_labels: List[str] = []
+        if _goto_with_retries(mgr, url_r_base, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+            P(mgr).wait_for_timeout(600)
+            style_labels = _kbb_collect_style_options(mgr)
+
+        # Style synonyms that mean default/no trim param
+        base_syn = {"base style", "base", "standard", "std"}
+
+        for lab in style_labels:
+            lab_clean = (lab or "").strip()
+            if not lab_clean:
+                continue
+            # Default style: values equal to base; no extra fetch needed
+            if lab_clean.lower() in base_syn:
+                # Ensure ordering retail >= trade_in
+                rtv = base_vals.get('retail')
+                tiv = base_vals.get('trade_in')
+                try:
+                    if isinstance(rtv, int) and isinstance(tiv, int) and tiv > rtv:
+                        rtv, tiv = tiv, rtv
+                except Exception:
+                    pass
+                styles[lab_clean] = {'retail': rtv, 'trade_in': tiv}
+                continue
+
+            # Try fast path: direct params with &trim= label
+            q_trim = "&" + urlencode({"trim": lab_clean})
+            rtv: Optional[int] = None
+            tiv: Optional[int] = None
+            # Retail page by trim: trust only retail
+            try:
+                url_r = url_r_base + q_trim
+                if _goto_with_retries(mgr, url_r, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+                    P(mgr).wait_for_timeout(550)
+                    vr = kbb_extract_values_from_page(mgr)
+                    rtv = vr.get('retail') if isinstance(vr.get('retail'), int) else vr.get('retail')
+            except Exception:
+                pass
+            # Trade-in page by trim: trust only trade-in
+            try:
+                url_t = base + "?pricetype=tradein&vehicleclass=motorcycles" + q_trim
+                if _goto_with_retries(mgr, url_t, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+                    P(mgr).wait_for_timeout(550)
+                    vt = kbb_extract_values_from_page(mgr)
+                    tiv = vt.get('trade_in') if isinstance(vt.get('trade_in'), int) else vt.get('trade_in')
+            except Exception:
+                pass
+
+            # Sanity: swap if reversed
+            try:
+                if isinstance(rtv, int) and isinstance(tiv, int) and tiv > rtv:
+                    rtv, tiv = tiv, rtv
+            except Exception:
+                pass
+            styles[lab_clean] = {'retail': rtv, 'trade_in': tiv}
+    except Exception:
+        pass
+    return base_vals, styles
 
 def _kbb_collect_model_links_js(mgr: BrowserMgr, year: int, make: str) -> List[Tuple[str, str]]:
     try:
@@ -543,7 +661,7 @@ def _kbb_list_models_for_year_make(mgr: BrowserMgr, year: int, make: str, list_p
                     href = kbb_canonical(href)
                     m = re.search(rf"/motorcycles/{make}/([^/?#]+)/{year}(?:[/?#]|$)", href, flags=re.I)
                     if not m: continue
-                    slug = m.group(2).lower()
+                    slug = m.group(1).lower()
                     if not slug or slug == "motorcycles": continue
                     txt = (anchors.nth(i).text_content() or "").strip()
                     pairs.append((href, txt))
@@ -754,32 +872,271 @@ def _kbb_open_model_dropdown(mgr: BrowserMgr) -> bool:
         pass
     return _kbb_click_dropdown(mgr, ["model", "select model", "choose model"])
 
+def _kbb_collect_style_options(mgr: BrowserMgr) -> List[str]:
+    """Enumerate style/trim options from a native select labeled 'Style'/'Trim'."""
+    try:
+        js = r"""
+        () => {
+          const sels = Array.from(document.querySelectorAll('select'));
+          const isStyleSel = (s) => {
+            const p=(s.getAttribute('placeholder')||'').toLowerCase();
+            const a=(s.getAttribute('aria-label')||'').toLowerCase();
+            const n=(s.getAttribute('name')||'').toLowerCase();
+            return p.includes('style') || a.includes('style') || n.includes('style') || p.includes('trim') || a.includes('trim') || n.includes('trim');
+          };
+          for (const s of sels) {
+            if (!isStyleSel(s)) continue;
+            const out=[];
+            for (const o of Array.from(s.querySelectorAll('option'))) {
+              const t=(o.innerText||o.textContent||'').trim();
+              if (!t) continue;
+              if (o.disabled) continue;
+              const tl=t.toLowerCase();
+              if (tl==='style' || tl==='trim') continue; // placeholder
+              out.push(t);
+            }
+            if (out.length) return out;
+          }
+          return [];
+        }
+        """
+        arr = P(mgr).evaluate(js) or []
+        return [str(x).strip() for x in arr if str(x).strip()]
+    except Exception:
+        return []
+
+def _kbb_select_style(mgr: BrowserMgr, style_label: str) -> bool:
+    raw = (style_label or '').strip()
+    if not raw:
+        return False
+    try:
+        sel = P(mgr).locator("xpath=//select[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'style') or contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'style') or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'style') or contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'trim') or contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'trim') or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'trim')]").first
+        if sel.count() > 0:
+            try:
+                sel.select_option(label=raw)
+                P(mgr).wait_for_timeout(350)
+                return True
+            except Exception:
+                try:
+                    opt = sel.locator(f"xpath=.//option[normalize-space(.)='{raw}']").first
+                    if opt.count() > 0:
+                        opt.click()
+                        P(mgr).wait_for_timeout(350)
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
+
 def _kbb_collect_models_from_dropdown(mgr: BrowserMgr) -> List[str]:
     models: List[str] = []
     try:
-        # Open model dropdown and read all options visible
+        # 1) Native <select placeholder="Model"> path (as in your example)
+        try:
+            js = r"""
+            () => {
+              const sels = Array.from(document.querySelectorAll('select'));
+              const isModelSel = (s) => {
+                const p=(s.getAttribute('placeholder')||'').toLowerCase();
+                const a=(s.getAttribute('aria-label')||'').toLowerCase();
+                const n=(s.getAttribute('name')||'').toLowerCase();
+                return p.includes('model') || a.includes('model') || n.includes('model');
+              };
+              for (const s of sels) {
+                if (!isModelSel(s)) continue;
+                const out=[];
+                for (const o of Array.from(s.querySelectorAll('option'))) {
+                  const t=(o.innerText||o.textContent||'').trim();
+                  if (!t) continue;
+                  if (o.disabled) continue;
+                  if (t.toLowerCase()==='model') continue; // placeholder
+                  out.push(t);
+                }
+                if (out.length) return out;
+              }
+              return [];
+            }
+            """
+            arr = P(mgr).evaluate(js)
+            if isinstance(arr, list) and arr:
+                # Preserve DOM order
+                return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+
+        # 2) Fallback: open a custom combobox/listbox and enumerate role=option with scrolling
         if not _kbb_open_model_dropdown(mgr):
             return []
-        opts = P(mgr).locator("xpath=(//li|//button|//div)[@role='option' or contains(@class,'option') or contains(@class,'menu') or contains(@class,'list') or contains(@id,'option')]")
-        n = min(opts.count(), 200)
-        for i in range(n):
-            t = (opts.nth(i).text_content() or "").strip()
-            if not t:
-                continue
-            # ignore generic items
-            tl = t.lower()
-            if any(x in tl for x in ["select", "choose", "all models", "see all", "filter"]):
-                continue
-            if t not in models:
-                models.append(t)
+
+        seen: List[str] = []
+        stability = 0
+
+        def _add_visible_options() -> int:
+            added = 0
+            try:
+                opts = P(mgr).get_by_role("option")
+            except Exception:
+                opts = P(mgr).locator("xpath=(//li|//button|//div)[@role='option' or contains(@class,'option') or contains(@class,'menu') or contains(@class,'list') or contains(@id,'option')]")
+            count = min(getattr(opts, 'count', lambda: 0)(), 400)
+            for i in range(count):
+                try:
+                    t = (opts.nth(i).text_content() or "").strip()
+                except Exception:
+                    t = ""
+                if not t:
+                    continue
+                tl = t.lower()
+                if any(x in tl for x in ["select", "choose", "all models", "see all", "filter", "model"]):
+                    continue
+                if t not in seen:
+                    seen.append(t)
+                    added += 1
+            return added
+
+        listbox = None
+        try:
+            lb = P(mgr).get_by_role("listbox").first
+            if lb.count() > 0:
+                listbox = lb
+        except Exception:
+            listbox = None
+        if listbox is None:
+            try:
+                lb = P(mgr).locator("xpath=(//*[@role='listbox' or contains(@class,'menu') or contains(@class,'list')])[1]").first
+                if lb.count() > 0:
+                    listbox = lb
+            except Exception:
+                listbox = None
+
+        _ = _add_visible_options()
+        for _i in range(60):
+            before = len(seen)
+            did_scroll = False
+            try:
+                if listbox is not None:
+                    try:
+                        listbox.evaluate("el => { el.scrollTop = Math.min(el.scrollTop + 700, el.scrollHeight); }")
+                        did_scroll = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            if not did_scroll:
+                try:
+                    if listbox is not None:
+                        listbox.press("PageDown")
+                    else:
+                        P(mgr).keyboard.press("PageDown")
+                except Exception:
+                    pass
+            P(mgr).wait_for_timeout(160)
+            _ = _add_visible_options()
+            after = len(seen)
+            stability = stability + 1 if after <= before else 0
+            if stability >= 6:
+                break
+
+        models = seen
     except Exception:
         return []
     return models
 
+def _kbb_collect_models_and_slugs(mgr: BrowserMgr, year: int, make: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Return a list of (label, slug_guess) pairs for the brand-year page.
+    - Prefer native <select placeholder/name/aria-label="Model"> options.
+    - Attempt to parse a slug from option value/attributes if present; else None.
+    - When slug is None, caller can fall back to selecting from dropdown to discover it.
+    """
+    pairs: List[Tuple[str, Optional[str]]] = []
+    try:
+        js = r"""
+        (y,m) => {
+          const out=[];
+          const sels = Array.from(document.querySelectorAll('select'));
+          const isModelSel = (s) => {
+            const p=(s.getAttribute('placeholder')||'').toLowerCase();
+            const a=(s.getAttribute('aria-label')||'').toLowerCase();
+            const n=(s.getAttribute('name')||'').toLowerCase();
+            return p.includes('model') || a.includes('model') || n.includes('model');
+          };
+          const rx = new RegExp(`/motorcycles/${m}/([^/]+)/${y}(?:[/?#]|$)`, 'i');
+          for (const s of sels) {
+            if (!isModelSel(s)) continue;
+            const opts = Array.from(s.querySelectorAll('option'));
+            for (const o of opts) {
+              const t=(o.innerText||o.textContent||'').trim();
+              if (!t) continue;
+              if (o.disabled) continue;
+              if (t.toLowerCase()==='model') continue;
+              let slug=null;
+              const val=(o.getAttribute('value')||'');
+              const attrs=[val, o.getAttribute('data-value')||'', o.getAttribute('data-href')||'', o.getAttribute('data-url')||''];
+              for (const a of attrs) {
+                if (!a) continue;
+                let m1=a.match(rx);
+                if (m1 && m1[1]) { slug=(m1[1].toLowerCase()); break; }
+                // plain slug value like "yzf-r1"
+                if (/^[a-z0-9\-]+$/i.test(a) && a.length <= 64 && !/^model$/i.test(a)) {
+                  slug = a.toLowerCase(); break;
+                }
+              }
+              out.push([t, slug]);
+            }
+            if (out.length) return out;
+          }
+          return out;
+        }
+        """
+        arr = P(mgr).evaluate(js, int(year), str(make)) or []
+        for it in arr:
+            try:
+                label = str(it[0]).strip()
+                slug = (str(it[1]).strip().lower()) if (len(it) > 1 and it[1]) else None
+                if label:
+                    # Always provide a fallback slug guess from label and normalize to avoid style-only slugs
+                    guess = slug or _slugify(label)
+                    guess = kbb_normalize_model_slug(guess)
+                    pairs.append((label, guess))
+            except Exception:
+                continue
+        if pairs:
+            return pairs
+    except Exception:
+        pass
+    # Fallback to generic dropdown enumeration; provide slug guesses from labels
+    names = _kbb_collect_models_from_dropdown(mgr)
+    return [(n, kbb_normalize_model_slug(_slugify(n))) for n in names]
+
 def _kbb_select_model(mgr: BrowserMgr, model_name: str) -> bool:
+    # Prefer selecting on native <select> if present
+    raw = (model_name or "").strip()
+    if not raw:
+        return False
+    try:
+        sel = P(mgr).locator("xpath=//select[contains(translate(@placeholder,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'model') or contains(translate(@aria-label,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'model') or contains(translate(@name,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'model')]").first
+        if sel.count() > 0:
+            try:
+                sel.select_option(label=raw)
+                P(mgr).wait_for_timeout(250)
+                return True
+            except Exception:
+                # If select_option by label fails, try by visible option click
+                try:
+                    opt = sel.locator(f"xpath=.//option[normalize-space(.)='{raw}']").first
+                    if opt.count() > 0:
+                        opt.click()
+                        P(mgr).wait_for_timeout(250)
+                        return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Fallback to combobox/listbox selection
     if not _kbb_open_model_dropdown(mgr):
         return False
-    return _kbb_choose_option(mgr, model_name)
+    return _kbb_choose_option(mgr, raw)
 
 def _kbb_maybe_select_first_trim(mgr: BrowserMgr) -> None:
     # Some models require trim; attempt to pick first/"Base"
@@ -1247,7 +1604,7 @@ def nada_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cac
 def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cache_path: str,
                   list_pause_ms: int, detail_pause_ms: int, backoff_seconds: int,
                   progress_path: str, resume: bool, merge_cache: bool,
-                  zip_code: Optional[str] = None):
+                  zip_code: Optional[str] = None, workers: int = 1, include_styles: bool = False):
     """
     Crawl KBB once to build the KBB cache.
     For each Year/Make: discover model links, try to open a values view,
@@ -1256,6 +1613,8 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
     cache: Dict = kbb_cache_load(cache_path) if merge_cache else {}
     ymin, ymax = years
     total_models = 0
+    direct_hits = 0
+    dropdown_fallbacks = 0
     resume_year, resume_make, resume_last_url = (load_progress(progress_path) if resume else (None, None, None))
     skipping = (resume_year, resume_make) if (resume and resume_year and resume_make) else None
     if not resume and Path(progress_path).exists():
@@ -1273,16 +1632,31 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
             # Prefer brand-root wizard; fallback to site wizard then anchor discovery
             try:
                 models: List[Tuple[str, str]] = []
-                if _kbb_go_to_brand(mgr, make):
-                    _kbb_select_year_on_brand_page(mgr, year)
-                    names = _kbb_collect_models_from_dropdown(mgr)
-                    if names:
-                        models = [(f"dropdown://{year}/{make}/{_slugify(n)}", n) for n in names]
+                # 1) Prefer direct brand-year page (dropdown shows models here)
+                brand_year_url = f"https://www.kbb.com/motorcycles/{make}/{year}/"
+                if mgr.goto(brand_year_url):
+                    P(mgr).wait_for_timeout(800)
+                    pairs = _kbb_collect_models_and_slugs(mgr, year, make)
+                    if pairs:
+                        for label, slug in pairs:
+                            # Always prefer slug-first attempts; selection is last-resort
+                            models.append((f"slug://{slug}", label))
+                # 2) Brand wizard (brand root → pick year → models dropdown)
+                if not models:
+                    if _kbb_go_to_brand(mgr, make):
+                        _kbb_select_year_on_brand_page(mgr, year)
+                        pairs = _kbb_collect_models_and_slugs(mgr, year, make)
+                        if pairs:
+                            for label, slug in pairs:
+                                models.append((f"slug://{slug}", label))
+                # 3) Site wizard (motorcycles home → pick year/make → models dropdown)
                 if not models:
                     if _kbb_select_year_make(mgr, year, make, zip_code):
-                        names = _kbb_collect_models_from_dropdown(mgr)
-                        if names:
-                            models = [(f"dropdown://{year}/{make}/{_slugify(n)}", n) for n in names]
+                        pairs = _kbb_collect_models_and_slugs(mgr, year, make)
+                        if pairs:
+                            for label, slug in pairs:
+                                models.append((f"slug://{slug}", label))
+                # 4) Absolute fallback: try anchor discovery (rarely present on KBB)
                 if not models:
                     models = _kbb_list_models_for_year_make(mgr, year, make, list_pause_ms)
             except Exception as e:
@@ -1291,9 +1665,9 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                 continue
             LOG.info(f"KBB scan {year}/{make}: discovered {len(models)} candidate model links")
 
-            # Resume: skip up to last URL if provided
+            # Resume: skip up to last URL if provided (disabled when workers>1)
             start_idx = 0
-            if resume and resume_year == year and (resume_make or '').lower() == (make or '').lower() and resume_last_url:
+            if workers <= 1 and resume and resume_year == year and (resume_make or '').lower() == (make or '').lower() and resume_last_url:
                 try:
                     canon_resume = kbb_canonical(resume_last_url)
                     for i, (u, _t) in enumerate(models):
@@ -1302,17 +1676,170 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                 except Exception:
                     pass
 
+            # Parallel execution path using multiple browser workers
+            if max(1, int(workers)) > 1 and models:
+                jobs: List[Tuple[str, str]] = []
+                for (u, label) in models[start_idx:]:
+                    if not label:
+                        continue
+                    if u.startswith("slug://"):
+                        slug_guess = u.split("slug://", 1)[1]
+                    else:
+                        slug_guess = _slugify(label)
+                    jobs.append((label, slug_guess))
+
+                def _do_one(idx: int, label: str, slug_guess: str) -> Optional[Tuple[str, Dict[str, Optional[int]], Dict[str, Dict[str, Optional[int]]], str, str]]:
+                    wm = BrowserMgr(
+                        user_data_dir=(str(mgr.user_data_dir) + f"-kbbw-{idx}" if mgr.user_data_dir else f"./playwright_profile_kbbw_{idx}"),
+                        headless=mgr.headless,
+                        allow_domains={"kbb.com", "kbbcdn.com"},
+                        restart_after_navs=mgr.restart_after_navs,
+                        recycle_every_seconds=mgr.recycle_every_seconds,
+                        nav_timeout_ms=mgr.nav_timeout_ms,
+                    )
+                    try:
+                        wm.start()
+                        mslug = slug_guess or _slugify(label)
+                        if include_styles:
+                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms)
+                        else:
+                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms)
+                            styles_map = {}
+                        if not (vals.get('trade_in') or vals.get('retail')):
+                            by_url = f"https://www.kbb.com/motorcycles/{make}/{year}/"
+                            if wm.goto(by_url):
+                                P(wm).wait_for_timeout(400)
+                                if _kbb_select_model(wm, label):
+                                    _kbb_maybe_select_first_trim(wm)
+                                    _kbb_click_next(wm)
+                                    m = re.search(r"/motorcycles/[^/]+/([^/]+)/\d{4}(?:[/?#]|$)", P(wm).url)
+                                    if m:
+                                        mslug = m.group(1)
+                                        if include_styles:
+                                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms)
+                                        else:
+                                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms)
+                                            styles_map = {}
+                                    else:
+                                        v2 = kbb_extract_values_from_page(wm)
+                                        if v2.get('trade_in') is not None and vals.get('trade_in') is None:
+                                            vals['trade_in'] = v2.get('trade_in')
+                                        if v2.get('retail') is not None and vals.get('retail') is None:
+                                            vals['retail'] = v2.get('retail')
+                        if not (vals.get('trade_in') or vals.get('retail')):
+                            return None
+                        base = kbb_model_base_url(make, mslug, year)
+                        url_trade = base + "?pricetype=tradein&vehicleclass=motorcycles"
+                        url_retail = base + "?pricetype=retail&vehicleclass=motorcycles"
+                        final_url = url_retail if vals.get('retail') is not None else url_trade
+                        return (mslug, vals, styles_map, label, final_url)
+                    except Exception:
+                        return None
+                    finally:
+                        try:
+                            wm.stop()
+                        except Exception:
+                            pass
+
+                with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+                    futs = []
+                    for i, (label, slug_guess) in enumerate(jobs):
+                        futs.append(ex.submit(_do_one, i, label, slug_guess))
+                    for fut in as_completed(futs):
+                        res = fut.result()
+                        if not res:
+                            continue
+                        mslug, vals, styles_map, label, final_url = res
+                        mslug = kbb_normalize_model_slug(mslug)
+                        yr = str(year); mk = make.lower()
+                        cache.setdefault(yr, {}).setdefault(mk, {})
+                        cache[yr][mk][mslug] = {
+                            "title": label or mslug.replace("-"," ").upper(),
+                            "trade_in": vals.get("trade_in"),
+                            "retail": vals.get("retail"),
+                            "styles": styles_map if styles_map else None,
+                            "url": final_url,
+                        }
+                        total_models += 1
+                        direct_hits += 1
+                        if total_models % 25 == 0:
+                            kbb_cache_save(cache_path, cache)
+                # Done with parallel processing for this year/make
+                continue
+
             for (url, title) in models[start_idx:]:
                 try:
                     P(mgr).wait_for_timeout(detail_pause_ms + random.randint(0, 350))
                     used_dropdown = url.startswith("dropdown://")
+                    used_slug = url.startswith("slug://")
                     if used_dropdown:
-                        # Select the model in-place
+                        # Ensure we are back on the brand-year page before each selection
+                        brand_year_url = f"https://www.kbb.com/motorcycles/{make}/{year}/"
+                        if not mgr.goto(brand_year_url):
+                            continue
+                        P(mgr).wait_for_timeout(400)
+                        # Open dropdown and select the model by label
                         if not _kbb_select_model(mgr, title):
                             continue
                         _kbb_maybe_select_first_trim(mgr)
-                        # proceed to value type step
+                        # Some flows require advancing; try but don't depend on it
                         _kbb_click_next(mgr)
+                    elif used_slug:
+                        # Go directly to price pages using the discovered slug
+                        mslug = url.split("slug://", 1)[1]
+                        # Fetch base + optional styles
+                        if include_styles:
+                            vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms)
+                        else:
+                            vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms)
+                            styles_map = {}
+                        if not (vals.get('trade_in') or vals.get('retail')):
+                            # try a conservative slugify of the label as a fallback guess
+                            guess = _slugify(title)
+                            if guess and guess != mslug:
+                                if include_styles:
+                                    vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, guess, detail_pause_ms)
+                                else:
+                                    vals = _kbb_fetch_prices_via_params(mgr, year, make, guess, detail_pause_ms)
+                                    styles_map = {}
+                                if (vals.get('trade_in') or vals.get('retail')):
+                                    mslug = guess
+                        if (vals.get('trade_in') or vals.get('retail')):
+                            # Fast-path: record without further navigation
+                            yr = str(year); mk = make.lower()
+                            cache.setdefault(yr, {}).setdefault(mk, {})
+                            raw_slug = kbb_normalize_model_slug(mslug)
+                            base = kbb_model_base_url(make, raw_slug, year)
+                            url_trade = base + "?pricetype=tradein&vehicleclass=motorcycles"
+                            url_retail = base + "?pricetype=retail&vehicleclass=motorcycles"
+                            cache[yr][mk][raw_slug] = {
+                                "title": title or raw_slug.replace("-"," ").upper(),
+                                "trade_in": vals.get("trade_in"),
+                                "retail": vals.get("retail"),
+                                "styles": styles_map if styles_map else None,
+                                # Prefer a retail URL when available
+                                "url": url_retail if vals.get("retail") is not None else url_trade,
+                            }
+                            total_models += 1
+                            direct_hits += 1
+                            try:
+                                save_progress(progress_path, year, make, cache[yr][mk][raw_slug]["url"])
+                            except Exception:
+                                pass
+                            if total_models % 25 == 0:
+                                kbb_cache_save(cache_path, cache)
+                            # Skip the rest of the flow
+                            continue
+                        # fallback to dropdown selection if direct param failed
+                        brand_year_url = f"https://www.kbb.com/motorcycles/{make}/{year}/"
+                        if not mgr.goto(brand_year_url):
+                            continue
+                        P(mgr).wait_for_timeout(400)
+                        if not _kbb_select_model(mgr, title):
+                            continue
+                        _kbb_maybe_select_first_trim(mgr)
+                        _kbb_click_next(mgr)
+                        dropdown_fallbacks += 1
                     else:
                         if not mgr.goto(kbb_canonical(url)):
                             continue
@@ -1324,14 +1851,17 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                             LOG.warning("KBB: still blocked; skipping this model.");
                             continue
 
-                    # Prefer direct price-type URLs for stability
-                    # Determine slug from current URL or best-effort from title
+                    # Prefer direct price-type URLs for stability (post-selection only)
                     mslug: Optional[str] = None
                     m = re.search(r"/motorcycles/[^/]+/([^/]+)/\d{4}(?:[/?#]|$)", P(mgr).url)
                     if m: mslug = m.group(1)
                     if not mslug:
                         mslug = _slugify(title)
-                    vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms)
+                    if include_styles:
+                        vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms)
+                    else:
+                        vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms)
+                        styles_map = {}
                     if not (vals.get('trade_in') or vals.get('retail')):
                         # Fallback to clicking value buttons if direct URLs didn't render
                         _kbb_open_value_type(mgr, 'trade') or _kbb_try_open_values(mgr, zip_code)
@@ -1349,7 +1879,7 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
 
                     # Determine slug from URL or title
                     m = re.search(r"/motorcycles/[^/]+/([^/]+)/\d{4}(?:[/?#]|$)", P(mgr).url)
-                    raw_slug = m.group(1) if m else _slugify(title)
+                    raw_slug = kbb_normalize_model_slug(m.group(1) if m else _slugify(title))
 
                     yr = str(year); mk = make.lower()
                     cache.setdefault(yr, {}).setdefault(mk, {})
@@ -1358,6 +1888,7 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                         "title": title or use_slug.replace("-"," ").upper(),
                         "trade_in": vals.get("trade_in"),
                         "retail": vals.get("retail"),
+                        "styles": styles_map if styles_map else None,
                         "url": P(mgr).url,
                     }
                     total_models += 1
@@ -1370,7 +1901,7 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                 except Exception:
                     continue
     kbb_cache_save(cache_path, cache)
-    LOG.info(f"KBB scan complete. Models cached: {total_models}")
+    LOG.info(f"KBB scan complete. Models cached: {total_models} (direct={direct_hits}, fallback={dropdown_fallbacks})")
 
 # ============================== Live JDP (cache-first) ==============================
 def jdp_find_values_for_model(mgr: BrowserMgr, year: int, make: str, modelish: str,
@@ -2094,6 +2625,14 @@ def run_main():
     ap.add_argument("--kbb-cache-mode", choices=["merge","overwrite"], default="merge",
                     help="when scanning, merge into existing KBB cache or overwrite it (default: merge)")
     ap.add_argument("--kbb-zip", type=str, default=None, help="optional ZIP code for region-specific KBB values")
+    ap.add_argument("--kbb-workers", type=int, default=1, help="number of parallel browser workers for KBB scan")
+    ap.add_argument("--multitread", type=int, default=None, help="alias for --kbb-workers (e.g. --multitread 2)")
+    ap.add_argument("--kbb-styles", action="store_true", help="capture per-style (trim) values for each model")
+
+    # KBB quick debug: list models for a single year/make and exit
+    ap.add_argument("--kbb-list-models", action="store_true", help="list model labels and slug guesses for a single year/make and exit")
+    ap.add_argument("--kbb-year", type=int, default=None, help="year to use with --kbb-list-models")
+    ap.add_argument("--kbb-make", type=str, default=None, help="make (slug) to use with --kbb-list-models")
 
     # Browser
     ap.add_argument("--user-data-dir", type=str, default=None, help="Playwright profile dir (persists FB login cookies)")
@@ -2204,6 +2743,21 @@ def run_main():
         if args.login_fb:
             ensure_facebook_login(mgr, args.fb_login_mode, args.fb_wait_login_seconds); return
 
+        # KBB: quick list-and-exit for a single year/make
+        if args.kbb_list_models:
+            if not (args.kbb_year and args.kbb_make):
+                raise SystemExit("--kbb-list-models requires --kbb-year and --kbb-make")
+            mgr.allow_domains = {"kbb.com", "kbbcdn.com"}
+            url = f"https://www.kbb.com/motorcycles/{args.kbb_make.strip().lower()}/{int(args.kbb_year)}/"
+            if not mgr.goto(url):
+                raise SystemExit(f"Failed to open {url}")
+            P(mgr).wait_for_timeout(1000)
+            pairs = _kbb_collect_models_and_slugs(mgr, int(args.kbb_year), args.kbb_make.strip().lower())
+            print(f"KBB {args.kbb_year}/{args.kbb_make.lower()} models: {len(pairs)}")
+            for label, slug in pairs:
+                print(f" - {label} :: slug={slug or '(unknown)'}")
+            return
+
         if args.nada_scan_once:
             years = parse_years_span(args.nada_scan_years)
             makes = [m.strip().lower() for m in args.nada_scan_makes.split(",") if m.strip()]
@@ -2218,11 +2772,16 @@ def run_main():
             kbb_years = parse_years_span(args.kbb_scan_years)
             kbb_makes = [m.strip().lower() for m in args.kbb_scan_makes.split(",") if m.strip()]
             kbb_path = args.kbb_cache or "kbb-cache.json"
-            # Allow KBB network
-            mgr.allow_domains = {"kbb.com"}
+            # Allow KBB network (include CDN)
+            mgr.allow_domains = {"kbb.com", "kbbcdn.com"}
             LOG.info(f"Starting KBB scan (scaffold) {kbb_years} for makes={kbb_makes} -> {kbb_path}")
+            workers = args.kbb_workers if args.kbb_workers and args.kbb_workers>0 else 1
+            if args.multitread and args.multitread>0:
+                workers = args.multitread
+            if workers > 1 and args.resume:
+                LOG.warning("--resume is disabled when using multiple workers; proceeding without resume.")
             kbb_scan_once(mgr, kbb_years, kbb_makes, kbb_path, args.nada_list_pace_ms, args.nada_pace_ms,
-                          args.backoff_seconds, args.kbb_progress, False, args.kbb_cache_mode=="merge", args.kbb_zip)
+                          args.backoff_seconds, args.kbb_progress, False, args.kbb_cache_mode=="merge", args.kbb_zip, workers, bool(args.kbb_styles))
             return
 
         # Marketplaces need full network (drop allowlist)
