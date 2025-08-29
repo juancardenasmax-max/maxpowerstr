@@ -245,11 +245,39 @@ class BrowserMgr:
     def start(self):
         self.pw = sync_playwright().start()
         prof = Path(self.user_data_dir).resolve(); prof.mkdir(parents=True, exist_ok=True)
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        if self.headless:
+            # Improve headless stability in CI/servers and reduce detection
+            launch_args += [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1366,900",
+                "--hide-scrollbars",
+            ]
         self.context = self.pw.chromium.launch_persistent_context(
             user_data_dir=str(prof), headless=self.headless,
-            viewport={"width":1366,"height":900}, args=["--disable-blink-features=AutomationControlled"]
+            viewport={"width":1366,"height":900}, args=launch_args,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/121.0.0.0 Safari/537.36"
+            ),
+            locale="en-US"
         )
         self.context.route("**/*", self._route_filter)
+        try:
+            # Light stealth: mask webdriver/language/platform hints
+            self.context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'language', {get: () => 'en-US'});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                """
+            )
+        except Exception:
+            pass
         self.page = self.context.new_page(); self.page.set_default_navigation_timeout(self.nav_timeout_ms)
         self._last_recycle = time.time()
 
@@ -478,6 +506,72 @@ def kbb_normalize_model_slug(slug: str) -> str:
             s = s.strip('-')
     return s
 
+# ------------------------------ KBB navigation reliability & pacing ------------------------------
+_KBB_WAIT_MODE = "auto"  # auto|dom|net
+_KBB_RATE_MS = 0
+_KBB_JITTER_MS = 0
+
+class _RateLimiter:
+    def __init__(self, min_interval_ms: int):
+        self.min_interval = max(0, int(min_interval_ms)) / 1000.0
+        self._last = 0.0
+        self._lock = threading.Lock()
+    def acquire(self):
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            wait = self.min_interval - (now - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.time()
+
+_KBB_RL: Optional[_RateLimiter] = None
+
+def set_kbb_nav_prefs(wait_mode: str, rate_ms: int, jitter_ms: int):
+    global _KBB_WAIT_MODE, _KBB_RATE_MS, _KBB_JITTER_MS, _KBB_RL
+    mode = (wait_mode or "auto").strip().lower()
+    if mode not in ("auto","dom","net"):
+        mode = "auto"
+    _KBB_WAIT_MODE = mode
+    _KBB_RATE_MS = max(0, int(rate_ms or 0))
+    _KBB_JITTER_MS = max(0, int(jitter_ms or 0))
+    _KBB_RL = _RateLimiter(_KBB_RATE_MS) if _KBB_RATE_MS > 0 else None
+
+def _kbb_rate_pause():
+    try:
+        if _KBB_RL is not None:
+            _KBB_RL.acquire()
+    except Exception:
+        pass
+    try:
+        if _KBB_JITTER_MS > 0:
+            time.sleep(random.uniform(0, _KBB_JITTER_MS/1000.0))
+    except Exception:
+        pass
+
+def _nav_waits_for_mode() -> Tuple[str, ...]:
+    if _KBB_WAIT_MODE == "dom":
+        return ("domcontentloaded",)
+    if _KBB_WAIT_MODE == "net":
+        return ("networkidle",)
+    return ("networkidle","domcontentloaded")
+
+def _goto_kbb(mgr: BrowserMgr, url: str) -> bool:
+    """KBB navigation wrapper with rate limiting, jitter, and wait-mode fallback."""
+    waits = _nav_waits_for_mode()
+    for w in waits:
+        _kbb_rate_pause()
+        if mgr.goto(url, wait=w):
+            P(mgr).wait_for_timeout(300)
+            if mgr.looks_blocked():
+                LOG.warning(f"KBB: block/anti-bot page detected during nav to {url}; recycling…")
+                time.sleep(2)
+                mgr.recycle()
+                continue
+            return True
+    return False
+
 # ------------------------------ KBB navigation reliability ------------------------------
 def _goto_with_retries(mgr: BrowserMgr, url: str, *, waits=("networkidle","domcontentloaded"), retries: int = 2, pause_ms: int = 250) -> bool:
     """Navigate with a couple of attempts and different wait strategies.
@@ -503,7 +597,7 @@ def _goto_with_retries(mgr: BrowserMgr, url: str, *, waits=("networkidle","domco
         P(mgr).wait_for_timeout(min(1200, 300 + attempt * 300))
     return False
 
-def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int) -> Dict[str, Optional[int]]:
+def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int, zip_code: Optional[str] = None) -> Dict[str, Optional[int]]:
     out: Dict[str, Optional[int]] = {"trade_in": None, "retail": None}
     base = kbb_model_base_url(make, model_slug, year)
     # Trade-In
@@ -512,13 +606,23 @@ def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_sl
         url_t = base + "?pricetype=tradein&vehicleclass=motorcycles"
         P(mgr).wait_for_timeout(detail_pause_ms//2 if detail_pause_ms else 400)
         # Try networkidle then domcontentloaded to avoid long hangs
-        if _goto_with_retries(mgr, url_t, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+        if _goto_kbb(mgr, url_t):
             # Small settle time then extract
             P(mgr).wait_for_timeout(500)
             v = kbb_extract_values_from_page(mgr)
             # Only trust trade-in value on the trade-in page
             if v.get("trade_in") is not None:
                 out["trade_in"] = v.get("trade_in")
+            elif zip_code:
+                # Attempt to set ZIP if value missing
+                try:
+                    _kbb_try_open_values(mgr, zip_code)
+                    P(mgr).wait_for_timeout(350)
+                    v = kbb_extract_values_from_page(mgr)
+                    if v.get("trade_in") is not None:
+                        out["trade_in"] = v.get("trade_in")
+                except Exception:
+                    pass
     except Exception:
         pass
     # Retail
@@ -527,45 +631,67 @@ def _kbb_fetch_prices_via_params(mgr: BrowserMgr, year: int, make: str, model_sl
             # Typical Listing Price (aka retail)
             url_r = base + "?pricetype=retail&vehicleclass=motorcycles"
             P(mgr).wait_for_timeout(300)
-            if _goto_with_retries(mgr, url_r, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+            if _goto_kbb(mgr, url_r):
                 P(mgr).wait_for_timeout(500)
                 v = kbb_extract_values_from_page(mgr)
                 if v.get("retail") is not None:
                     out["retail"] = v.get("retail")
                 if out.get("trade_in") is None and v.get("trade_in") is not None:
                     out["trade_in"] = v.get("trade_in")
+                elif zip_code and out.get("retail") is None:
+                    try:
+                        _kbb_try_open_values(mgr, zip_code)
+                        P(mgr).wait_for_timeout(350)
+                        v = kbb_extract_values_from_page(mgr)
+                        if v.get("retail") is not None:
+                            out["retail"] = v.get("retail")
+                    except Exception:
+                        pass
     except Exception:
         pass
     # Sanity: retail should not be lower than trade-in
     try:
         ti = out.get("trade_in"); rt = out.get("retail")
         if isinstance(ti, int) and isinstance(rt, int) and ti > rt:
-            out["trade_in"], out["retail"] = rt, ti
+            # Re-read retail once to confirm
+            try:
+                url_r2 = kbb_model_base_url(make, model_slug, year) + "?pricetype=retail&vehicleclass=motorcycles"
+                if _goto_kbb(mgr, url_r2):
+                    P(mgr).wait_for_timeout(350)
+                    v2 = kbb_extract_values_from_page(mgr)
+                    rt2 = v2.get("retail") if isinstance(v2.get("retail"), int) else v2.get("retail")
+                    if isinstance(rt2, int):
+                        rt = rt2
+            except Exception:
+                pass
+            if isinstance(ti, int) and isinstance(rt, int) and ti > rt:
+                LOG.warning("KBB: retail < trade-in after re-read; swapping values.")
+                out["trade_in"], out["retail"] = rt, ti
     except Exception:
         pass
     return out
 
-def _kbb_fetch_prices_and_styles(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int) -> Tuple[Dict[str, Optional[int]], Dict[str, Dict[str, Optional[int]]]]:
+def _kbb_fetch_prices_and_styles(mgr: BrowserMgr, year: int, make: str, model_slug: str, detail_pause_ms: int, zip_code: Optional[str] = None) -> Tuple[Dict[str, Optional[int]], Dict[str, Dict[str, Optional[int]]]]:
     """
     Fetch base trade-in and retail for a model, plus per-style values when a style/trim select is present.
     Returns (base_values, styles_map) where styles_map maps style label -> {'trade_in': int|None, 'retail': int|None}.
     """
-    base_vals = _kbb_fetch_prices_via_params(mgr, year, make, model_slug, detail_pause_ms)
+    base_vals = _kbb_fetch_prices_via_params(mgr, year, make, model_slug, detail_pause_ms, zip_code)
     styles: Dict[str, Dict[str, Optional[int]]] = {}
     try:
         base = kbb_model_base_url(make, model_slug, year)
         # Navigate to retail page (no trim) and enumerate style labels once
         url_r_base = base + "?pricetype=retail&vehicleclass=motorcycles"
         P(mgr).wait_for_timeout(250)
-        style_labels: List[str] = []
-        if _goto_with_retries(mgr, url_r_base, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+        style_pairs: List[Tuple[str, Optional[str]]] = []
+        if _goto_kbb(mgr, url_r_base):
             P(mgr).wait_for_timeout(600)
-            style_labels = _kbb_collect_style_options(mgr)
+            style_pairs = _kbb_collect_style_options(mgr)
 
         # Style synonyms that mean default/no trim param
         base_syn = {"base style", "base", "standard", "std"}
 
-        for lab in style_labels:
+        for lab, trim_param in (style_pairs or []):
             lab_clean = (lab or "").strip()
             if not lab_clean:
                 continue
@@ -583,25 +709,42 @@ def _kbb_fetch_prices_and_styles(mgr: BrowserMgr, year: int, make: str, model_sl
                 continue
 
             # Try fast path: direct params with &trim= label
-            q_trim = "&" + urlencode({"trim": lab_clean})
+            canonical_trim = (trim_param or lab_clean).strip()
+            q_trim = "&" + urlencode({"trim": canonical_trim})
             rtv: Optional[int] = None
             tiv: Optional[int] = None
             # Retail page by trim: trust only retail
             try:
                 url_r = url_r_base + q_trim
-                if _goto_with_retries(mgr, url_r, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+                if _goto_kbb(mgr, url_r):
                     P(mgr).wait_for_timeout(550)
                     vr = kbb_extract_values_from_page(mgr)
                     rtv = vr.get('retail') if isinstance(vr.get('retail'), int) else vr.get('retail')
+                    if rtv is None and zip_code:
+                        try:
+                            _kbb_try_open_values(mgr, zip_code)
+                            P(mgr).wait_for_timeout(350)
+                            vr = kbb_extract_values_from_page(mgr)
+                            rtv = vr.get('retail') if isinstance(vr.get('retail'), int) else vr.get('retail')
+                        except Exception:
+                            pass
             except Exception:
                 pass
             # Trade-in page by trim: trust only trade-in
             try:
                 url_t = base + "?pricetype=tradein&vehicleclass=motorcycles" + q_trim
-                if _goto_with_retries(mgr, url_t, waits=("networkidle","domcontentloaded"), retries=2, pause_ms=300):
+                if _goto_kbb(mgr, url_t):
                     P(mgr).wait_for_timeout(550)
                     vt = kbb_extract_values_from_page(mgr)
                     tiv = vt.get('trade_in') if isinstance(vt.get('trade_in'), int) else vt.get('trade_in')
+                    if tiv is None and zip_code:
+                        try:
+                            _kbb_try_open_values(mgr, zip_code)
+                            P(mgr).wait_for_timeout(350)
+                            vt = kbb_extract_values_from_page(mgr)
+                            tiv = vt.get('trade_in') if isinstance(vt.get('trade_in'), int) else vt.get('trade_in')
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -872,8 +1015,8 @@ def _kbb_open_model_dropdown(mgr: BrowserMgr) -> bool:
         pass
     return _kbb_click_dropdown(mgr, ["model", "select model", "choose model"])
 
-def _kbb_collect_style_options(mgr: BrowserMgr) -> List[str]:
-    """Enumerate style/trim options from a native select labeled 'Style'/'Trim'."""
+def _kbb_collect_style_options(mgr: BrowserMgr) -> List[Tuple[str, Optional[str]]]:
+    """Enumerate style/trim options as (label, trimParam) pairs from a native select labeled 'Style'/'Trim'."""
     try:
         js = r"""
         () => {
@@ -893,7 +1036,11 @@ def _kbb_collect_style_options(mgr: BrowserMgr) -> List[str]:
               if (o.disabled) continue;
               const tl=t.toLowerCase();
               if (tl==='style' || tl==='trim') continue; // placeholder
-              out.push(t);
+              let pv = (o.getAttribute('value')||'').trim();
+              if (!pv) pv = (o.getAttribute('data-value')||'').trim();
+              if (!pv) pv = (o.getAttribute('data-id')||'').trim();
+              if (!pv) pv = (o.getAttribute('data-trim')||'').trim();
+              out.push([t, pv||null]);
             }
             if (out.length) return out;
           }
@@ -901,7 +1048,21 @@ def _kbb_collect_style_options(mgr: BrowserMgr) -> List[str]:
         }
         """
         arr = P(mgr).evaluate(js) or []
-        return [str(x).strip() for x in arr if str(x).strip()]
+        pairs: List[Tuple[str, Optional[str]]] = []
+        for it in arr:
+            try:
+                if isinstance(it, list) and len(it) >= 2:
+                    lab = str(it[0]).strip()
+                    pv = (str(it[1]).strip() or None)
+                    if lab:
+                        pairs.append((lab, pv))
+                else:
+                    lab = str(it).strip()
+                    if lab:
+                        pairs.append((lab, None))
+            except Exception:
+                continue
+        return pairs
     except Exception:
         return []
 
@@ -1701,9 +1862,9 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                         wm.start()
                         mslug = slug_guess or _slugify(label)
                         if include_styles:
-                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms)
+                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms, zip_code)
                         else:
-                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms)
+                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms, zip_code)
                             styles_map = {}
                         if not (vals.get('trade_in') or vals.get('retail')):
                             by_url = f"https://www.kbb.com/motorcycles/{make}/{year}/"
@@ -1716,9 +1877,9 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                                     if m:
                                         mslug = m.group(1)
                                         if include_styles:
-                                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms)
+                                            vals, styles_map = _kbb_fetch_prices_and_styles(wm, year, make, mslug, detail_pause_ms, zip_code)
                                         else:
-                                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms)
+                                            vals = _kbb_fetch_prices_via_params(wm, year, make, mslug, detail_pause_ms, zip_code)
                                             styles_map = {}
                                     else:
                                         v2 = kbb_extract_values_from_page(wm)
@@ -1789,18 +1950,18 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                         mslug = url.split("slug://", 1)[1]
                         # Fetch base + optional styles
                         if include_styles:
-                            vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms)
+                            vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms, zip_code)
                         else:
-                            vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms)
+                            vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms, zip_code)
                             styles_map = {}
                         if not (vals.get('trade_in') or vals.get('retail')):
                             # try a conservative slugify of the label as a fallback guess
                             guess = _slugify(title)
                             if guess and guess != mslug:
                                 if include_styles:
-                                    vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, guess, detail_pause_ms)
+                                    vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, guess, detail_pause_ms, zip_code)
                                 else:
-                                    vals = _kbb_fetch_prices_via_params(mgr, year, make, guess, detail_pause_ms)
+                                    vals = _kbb_fetch_prices_via_params(mgr, year, make, guess, detail_pause_ms, zip_code)
                                     styles_map = {}
                                 if (vals.get('trade_in') or vals.get('retail')):
                                     mslug = guess
@@ -1858,9 +2019,9 @@ def kbb_scan_once(mgr: BrowserMgr, years: Tuple[int,int], makes: List[str], cach
                     if not mslug:
                         mslug = _slugify(title)
                     if include_styles:
-                        vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms)
+                        vals, styles_map = _kbb_fetch_prices_and_styles(mgr, year, make, mslug, detail_pause_ms, zip_code)
                     else:
-                        vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms)
+                        vals = _kbb_fetch_prices_via_params(mgr, year, make, mslug, detail_pause_ms, zip_code)
                         styles_map = {}
                     if not (vals.get('trade_in') or vals.get('retail')):
                         # Fallback to clicking value buttons if direct URLs didn't render
@@ -2628,6 +2789,9 @@ def run_main():
     ap.add_argument("--kbb-workers", type=int, default=1, help="number of parallel browser workers for KBB scan")
     ap.add_argument("--multitread", type=int, default=None, help="alias for --kbb-workers (e.g. --multitread 2)")
     ap.add_argument("--kbb-styles", action="store_true", help="capture per-style (trim) values for each model")
+    ap.add_argument("--kbb-wait-mode", choices=["auto","dom","net"], default="auto", help="page wait strategy: auto (networkidle→dom), dom, or net")
+    ap.add_argument("--kbb-rate-ms", type=int, default=300, help="min milliseconds between KBB navigations across workers")
+    ap.add_argument("--kbb-jitter-ms", type=int, default=300, help="max random jitter (ms) added to each KBB navigation")
 
     # KBB quick debug: list models for a single year/make and exit
     ap.add_argument("--kbb-list-models", action="store_true", help="list model labels and slug guesses for a single year/make and exit")
@@ -2747,6 +2911,8 @@ def run_main():
         if args.kbb_list_models:
             if not (args.kbb_year and args.kbb_make):
                 raise SystemExit("--kbb-list-models requires --kbb-year and --kbb-make")
+            # Apply KBB pacing/nav prefs
+            set_kbb_nav_prefs(args.kbb_wait_mode, args.kbb_rate_ms, args.kbb_jitter_ms)
             mgr.allow_domains = {"kbb.com", "kbbcdn.com"}
             url = f"https://www.kbb.com/motorcycles/{args.kbb_make.strip().lower()}/{int(args.kbb_year)}/"
             if not mgr.goto(url):
@@ -2774,6 +2940,8 @@ def run_main():
             kbb_path = args.kbb_cache or "kbb-cache.json"
             # Allow KBB network (include CDN)
             mgr.allow_domains = {"kbb.com", "kbbcdn.com"}
+            # Apply KBB pacing/nav prefs
+            set_kbb_nav_prefs(args.kbb_wait_mode, args.kbb_rate_ms, args.kbb_jitter_ms)
             LOG.info(f"Starting KBB scan (scaffold) {kbb_years} for makes={kbb_makes} -> {kbb_path}")
             workers = args.kbb_workers if args.kbb_workers and args.kbb_workers>0 else 1
             if args.multitread and args.multitread>0:
