@@ -27,6 +27,10 @@ from urllib.parse import urlencode, urlparse
 from playwright.sync_api import (
     sync_playwright, BrowserContext, Page, TimeoutError as PWTimeout
 )
+try:
+    import requests as _requests
+except Exception:
+    _requests = None
 
 # ============================== Logging ==============================
 LOG = logging.getLogger("bike-deal-bot")
@@ -162,6 +166,7 @@ def listing_fingerprint(title: str, price: Optional[int]) -> Optional[str]:
 # ============================== URL canonicalization ==============================
 _RE_FB_ITEM = re.compile(r"/marketplace/item/(\d+)/?")
 _RE_OU_ITEM = re.compile(r"/item/detail/([A-Za-z0-9\-]+)/?")
+_RE_CL_ITEM = re.compile(r"/([a-z]{2,})/([a-z]{3})/([\w\-]+)/?(\d+)\.html", re.I)
 
 def canonicalize_listing_url(url: str) -> str:
     try:
@@ -176,6 +181,20 @@ def canonicalize_listing_url(url: str) -> str:
             m = _RE_OU_ITEM.search(path)
             if m:
                 return f"https://offerup.com/item/detail/{m.group(1)}"
+        if "craigslist.org" in host:
+            # Normalize to scheme://<current-host>/<cat>/<postingid>.html
+            m = re.search(r"/(?:search|[a-z]{2,})/([a-z]{3})/.*?(\d+)\.html", path, flags=re.I)
+            if not m:
+                m2 = re.search(r"/([a-z]{2,})/([a-z]{3})/[^/]*(\d+)\.html", path, flags=re.I)
+            else:
+                m2 = None
+            pid = None; cat = None
+            if m:
+                cat = m.group(1).lower(); pid = m.group(2)
+            elif m2:
+                cat = m2.group(2).lower(); pid = m2.group(3)
+            if pid and cat:
+                return f"https://{host}/{cat}/{pid}.html"
         # Generic: strip query/fragment
         base = (url.split("#",1)[0]).split("?",1)[0]
         return base
@@ -315,6 +334,63 @@ class BrowserMgr:
 
 def P(mgr: BrowserMgr) -> Page:
     return mgr.page
+
+# ============================== Navigation helpers (generic settle) ==============================
+def wait_until_settled(mgr: BrowserMgr, selectors: Optional[List[str]] = None,
+                       timeout_ms: int = 8000, check_interval_ms: int = 250) -> bool:
+    """
+    Wait for the page to be reasonably "ready":
+    - Try load state 'load' quickly (non-fatal on failure)
+    - Until timeout: if any selector exists, return True
+    - Otherwise, sample body length and return when stable for a few cycles
+    """
+    end = time.time() + max(0.5, timeout_ms/1000.0)
+    try:
+        P(mgr).wait_for_load_state('load', timeout=min(timeout_ms, 2000))
+    except Exception:
+        pass
+    last_len = None; stable = 0
+    sels = selectors or []
+    while time.time() < end:
+        # Abort early if page was recycled/closed
+        try:
+            if hasattr(P(mgr), "is_closed") and P(mgr).is_closed():
+                return False
+        except Exception:
+            pass
+        # If caller provided target nodes, check them first
+        try:
+            for sel in sels:
+                try:
+                    loc = P(mgr).locator(sel)
+                    if loc.count() > 0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Heuristic: body size stability
+        try:
+            blen = P(mgr).evaluate("() => document.body ? document.body.innerText.length : 0")
+        except Exception:
+            blen = None
+        if isinstance(blen, int) and blen > 0:
+            if last_len is not None and abs(blen - last_len) < 20:
+                stable += 1
+                if stable >= 3:  # ~3*interval_ms ~ settled
+                    return True
+            else:
+                stable = 0
+            last_len = blen
+        P(mgr).wait_for_timeout(check_interval_ms)
+    return False
+
+def goto_and_wait(mgr: BrowserMgr, url: str, selectors: Optional[List[str]] = None,
+                  wait: str = 'domcontentloaded', timeout_ms: int = 9000) -> bool:
+    if not mgr.goto(url, wait=wait):
+        return False
+    ok = wait_until_settled(mgr, selectors, timeout_ms=timeout_ms)
+    return ok
 
 # ============================== CSV helper ==============================
 def _append_csv(path: str, row: Dict[str, object]) -> None:
@@ -2217,6 +2293,294 @@ def scrape_offerup(mgr: BrowserMgr, price_min: int, price_max: int, endpoint: st
     LOG.info(f"OfferUp {len(items)} raw items (dedup will follow)")
     return items
 
+# ============================== Craigslist ==============================
+def fetch_craigslist_detail_text(mgr: BrowserMgr, url: str) -> Optional[str]:
+    try:
+        if not goto_and_wait(mgr, url, selectors=["h1","#titletextonly",".postingtitle","[role=heading]"], timeout_ms=8000):
+            return None
+        P(mgr).wait_for_timeout(700)
+        try:
+            head = P(mgr).get_by_role("heading").first.text_content() or ""
+        except Exception:
+            head = ""
+        try:
+            body = P(mgr).evaluate("() => document.body ? document.body.innerText : ''") or ""
+        except Exception:
+            body = ""
+        text = (head + " \n " + body)
+        text = CLEAN_SPACES.sub(" ", text).strip()
+        if not text:
+            return None
+        return text[:2000]
+    except Exception:
+        # HTTP fallback
+        try:
+            if _requests is None:
+                return None
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            r = _requests.get(url, headers=headers, timeout=12)
+            if r.status_code != 200:
+                return None
+            html = r.text
+            txt = re.sub(r"<[^>]+>", " ", html)
+            txt = CLEAN_SPACES.sub(" ", txt).strip()
+            return txt[:2000] if txt else None
+        except Exception:
+            return None
+
+def _cl_collect_cards(mgr: BrowserMgr) -> List[Tuple[str,str]]:
+    try:
+        items = P(mgr).locator("li.cl-search-result")
+        out: List[Tuple[str,str]] = []
+        if items.count() > 0:
+            n = min(items.count(), 250)
+            for i in range(n):
+                try:
+                    li = items.nth(i)
+                    a = li.locator("a[href]").first
+                    href = a.get_attribute("href") or ""
+                    if not href:
+                        continue
+                    if href.startswith("/"):
+                        href = f"https://{urlparse(P(mgr).url).netloc}{href}"
+                    href = canonicalize_listing_url(href)
+                    title = (li.locator("h3 a").first.text_content() or a.text_content() or "").strip()
+                    try:
+                        pr = (li.locator(".price").first.text_content() or "").strip()
+                    except Exception:
+                        pr = ""
+                    label = (title + (f" {pr}" if pr else "")).strip()
+                    out.append((href, label))
+                except Exception:
+                    continue
+            return out
+        items = P(mgr).locator("li.result-row")
+        n = min(items.count(), 250)
+        out = []
+        for i in range(n):
+            try:
+                li = items.nth(i)
+                a = li.locator("a.result-title, a[href]").first
+                href = a.get_attribute("href") or ""
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = f"https://{urlparse(P(mgr).url).netloc}{href}"
+                href = canonicalize_listing_url(href)
+                title = (a.text_content() or "").strip()
+                try:
+                    pr = (li.locator("span.result-price").first.text_content() or "").strip()
+                except Exception:
+                    pr = ""
+                label = (title + (f" {pr}" if pr else "")).strip()
+                out.append((href, label))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+def _cl_collect_cards_html(mgr: BrowserMgr) -> List[Tuple[str,str]]:
+    """Very robust fallback: scan raw HTML for posting anchors and nearby price snippets."""
+    out: List[Tuple[str,str]] = []
+    try:
+        html = P(mgr).content() or ""
+    except Exception:
+        html = ""
+    if not html:
+        return out
+    try:
+        # Find posting links like /mca/<postid>.html or /<area>/<cat>/<postid>.html
+        for m in re.finditer(r"href=\"([^\"]+/(?:[a-z]{3})/(\d+)\.html)\"", html, flags=re.I):
+            href_rel = m.group(1)
+            pid = m.group(2)
+            try:
+                href = href_rel
+                if href.startswith("/"):
+                    host = urlparse(P(mgr).url).netloc
+                    href = f"https://{host}{href}"
+                href = canonicalize_listing_url(href)
+            except Exception:
+                continue
+            # Extract a simple label by looking around the link for title and price
+            span = 300
+            s = max(0, m.start()-span); e = min(len(html), m.end()+span)
+            chunk = html[s:e]
+            # Title heuristic: strip tags and compress spaces
+            title = re.sub(r"<[^>]+>", " ", chunk)
+            title = CLEAN_SPACES.sub(" ", title).strip()
+            # Try to isolate something readable
+            title = (title[:120]) if len(title) > 120 else title
+            # Price if present
+            pm = re.search(r"\$\s*([\d,]+)", chunk)
+            label = title
+            if pm:
+                label = f"{title} ${pm.group(1)}"
+            out.append((href, label))
+    except Exception:
+        return []
+    # Dedup by URL
+    seen=set(); uniq=[]
+    for href, lab in out:
+        if href in seen: continue
+        seen.add(href); uniq.append((href, lab))
+    return uniq
+
+def _cl_fetch_search_http(url: str) -> List[Tuple[str,str]]:
+    out: List[Tuple[str,str]] = []
+    if _requests is None:
+        return out
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = _requests.get(url, headers=headers, timeout=12)
+        if r.status_code != 200 or not r.text:
+            return out
+        html = r.text
+        base_host = urlparse(url).netloc
+        # Find posting anchors
+        for m in re.finditer(r"href=\"([^\"]+/(?:[a-z]{3})/[^\"]*(\d+)\.html)\"", html, flags=re.I):
+            href = m.group(1)
+            try:
+                if href.startswith("/"):
+                    href = f"https://{base_host}{href}"
+                href = canonicalize_listing_url(href)
+            except Exception:
+                continue
+            # Crude title/price context
+            s = max(0, m.start()-240); e = min(len(html), m.end()+240)
+            chunk = html[s:e]
+            title = re.sub(r"<[^>]+>", " ", chunk)
+            title = CLEAN_SPACES.sub(" ", title).strip()
+            title = title[:120]
+            pm = re.search(r"\$\s*([\d,]+)", chunk)
+            label = f"{title} ${pm.group(1)}" if pm else title
+            out.append((href, label))
+        # Dedup
+        seen=set(); uniq=[]
+        for href, lab in out:
+            if href in seen: continue
+            seen.add(href); uniq.append((href, lab))
+        return uniq
+    except Exception:
+        return []
+
+def scrape_craigslist(mgr: BrowserMgr, price_min: int, price_max: int, zip_code: str, radius: int,
+                      site: Optional[str] = None, endpoint: str = "mca",
+                      seen_index: Optional[Dict[str, Optional[int]]] = None,
+                      skip_urls: Optional[set] = None,
+                      exclude_parts: bool = True) -> List[Listing]:
+    items: List[Listing] = []
+    bases: List[str] = []
+    def _site_from_zip(z: str) -> Optional[str]:
+        try:
+            z = re.sub(r"\D+", "", z or "").strip()
+            if len(z) < 3:
+                return None
+            z3 = int(z[:3])
+        except Exception:
+            return None
+        if (750 <= z3 <= 754) or (760 <= z3 <= 764) or z3 in (761, 762):
+            return "dallas"
+        if 770 <= z3 <= 778:
+            return "houston"
+        if z3 in (733, 787) or 786 <= z3 <= 787:
+            return "austin"
+        if 780 <= z3 <= 782:
+            return "sanantonio"
+        if z3 == 767:
+            return "waco"
+        if z3 in (757, 759):
+            return "easttexas"
+        return None
+
+    use_site = (site or "").strip().lower() or _site_from_zip(zip_code)
+    if not use_site:
+        LOG.warning("Craigslist: no --cl-site and no ZIP mapping available; please pass --cl-site explicitly (e.g., dallas).")
+        return []
+    if endpoint in ("mca", "both"):
+        path = f"/search/mca?postal={zip_code}&search_distance={radius}&min_price={price_min}&max_price={price_max}&hasPic=1"
+        host = f"https://{use_site}.craigslist.org"
+        bases.append(host + path)
+    if endpoint in ("search", "both"):
+        path = f"/search/sss?query=motorcycle&postal={zip_code}&search_distance={radius}&min_price={price_min}&max_price={price_max}&hasPic=1"
+        host = f"https://{use_site}.craigslist.org"
+        bases.append(host + path)
+
+    seen = set()
+    for url in bases:
+        if not goto_and_wait(mgr, url, selectors=["li.cl-search-result","li.result-row",".search-legend",".cl-results","#search-results"], timeout_ms=15000):
+            continue
+        try:
+            # Nudge to trigger any lazy content
+            P(mgr).mouse.wheel(0, 6000)
+            P(mgr).wait_for_timeout(600)
+        except Exception:
+            pass
+        # Optional: read totalcount if present for diagnostics
+        try:
+            tc = None
+            legend = P(mgr).locator("css=.search-legend .totalcount").first
+            if legend.count() > 0:
+                tx = (legend.text_content() or "").strip()
+                if tx.isdigit():
+                    tc = int(tx)
+            if isinstance(tc, int) and tc == 0:
+                LOG.info("Craigslist reports 0 results by totalcount.")
+        except Exception:
+            pass
+        pairs = _cl_collect_cards(mgr)
+        if not pairs:
+            # scroll once more and try fallback HTML scan
+            try:
+                P(mgr).mouse.wheel(0, 12000)
+                P(mgr).wait_for_timeout(700)
+            except Exception:
+                pass
+            pairs = _cl_collect_cards_html(mgr)
+        if not pairs:
+            # Last-resort: HTTP fetch of the search page (bypasses headless quirks)
+            pairs = _cl_fetch_search_http(url)
+        consecutive_skips = 0
+        for href, label in pairs:
+            if href in seen:
+                continue
+            seen.add(href)
+            canon = href
+            if skip_urls is not None and canon in skip_urls:
+                consecutive_skips += 1
+                if consecutive_skips >= 40:
+                    break
+                continue
+            else:
+                consecutive_skips = 0
+            price = parse_price_from_text(label)
+            if seen_index is not None and canon in seen_index and price is not None and seen_index.get(canon) == price:
+                continue
+            title = re.sub(r"\$[\d,]+.*", "", label).strip() or "Craigslist Listing"
+            if exclude_parts and (is_likely_parts_or_gear(title) or is_likely_parts_or_gear(label)):
+                continue
+            if price is None and (seen_index is None or canon not in seen_index):
+                try:
+                    body = fetch_craigslist_detail_text(mgr, href) or ""
+                    p2 = parse_price_from_text(body)
+                    if p2 is not None:
+                        price = p2
+                except Exception:
+                    pass
+            if price is None:
+                continue
+            items.append(Listing(title=title, price=price, url=href, source="craigslist"))
+    LOG.info(f"Craigslist {len(items)} raw items (dedup will follow)")
+    return items
+
 # ============================== Facebook (FIXED: enrich weak titles) ==============================
 def _fb_collect_cards(mgr: BrowserMgr) -> List[Tuple[str,str]]:
     results = P(mgr).evaluate(r"""() => {
@@ -2239,7 +2603,22 @@ def ensure_facebook_login(mgr: BrowserMgr, mode: str, wait_seconds: int) -> bool
     if is_logged_in_facebook(P(mgr).context):
         LOG.info("Facebook login status: LOGGED IN"); return True
     LOG.warning("Facebook: not logged in. Opening login page…")
-    mgr.goto("https://www.facebook.com/login"); P(mgr).wait_for_timeout(800)
+    # Ensure allowlist is open for Facebook
+    try:
+        mgr.allow_domains = set()
+    except Exception:
+        pass
+    ok = goto_and_wait(mgr, "https://www.facebook.com/login",
+                       selectors=["input[name='email']","input[name='pass']","[data-testid='royal_login_button']","form"],
+                       timeout_ms=15000)
+    if not ok:
+        # Fallback to mobile login page which is often lighter
+        ok = goto_and_wait(mgr, "https://m.facebook.com/login.php",
+                           selectors=["input[name='email']","input[name='pass']","button[name='login']","form"],
+                           timeout_ms=15000)
+    if not ok:
+        LOG.warning("Facebook: could not open login page (network or block).")
+        return False
     mode = (mode or "wait").lower()
     if mode == "never": return False
     if mode == "enter":
@@ -2629,7 +3008,15 @@ def process_listings(mgr: BrowserMgr, listings: List[Listing], explain: bool, ye
                 continue
             
             # Before notifying, enrich with detail text to check miles and title flags
-            detail_text = fetch_facebook_detail_hints(mgr, li.url) if li.source == "facebook" else fetch_offerup_detail_text(mgr, li.url)
+            # Source-specific detail text for miles/title checks
+            if li.source == "facebook":
+                detail_text = fetch_facebook_detail_hints(mgr, li.url)
+            elif li.source == "offerup":
+                detail_text = fetch_offerup_detail_text(mgr, li.url)
+            elif li.source == "craigslist":
+                detail_text = fetch_craigslist_detail_text(mgr, li.url)
+            else:
+                detail_text = fetch_offerup_detail_text(mgr, li.url)
             miles_val = extract_miles_from_text((li.title + " \n " + (detail_text or "")).strip())
             flags = branded_title_flags(detail_text)
             if miles_val is not None and miles_val > max_miles:
@@ -2677,7 +3064,14 @@ def process_listings(mgr: BrowserMgr, listings: List[Listing], explain: bool, ye
                     if explain: LOG.info(f"Skip potential by fingerprint duplicate: {li.title} @ {li.price}")
                     continue
                 # Same miles/title gate for potentials before notifying/logging
-                detail_text = fetch_facebook_detail_hints(mgr, li.url) if li.source == "facebook" else fetch_offerup_detail_text(mgr, li.url)
+                if li.source == "facebook":
+                    detail_text = fetch_facebook_detail_hints(mgr, li.url)
+                elif li.source == "offerup":
+                    detail_text = fetch_offerup_detail_text(mgr, li.url)
+                elif li.source == "craigslist":
+                    detail_text = fetch_craigslist_detail_text(mgr, li.url)
+                else:
+                    detail_text = fetch_offerup_detail_text(mgr, li.url)
                 miles_val = extract_miles_from_text((li.title + " \n " + (detail_text or "")).strip())
                 flags = branded_title_flags(detail_text)
                 if miles_val is not None and miles_val > max_miles:
@@ -2743,6 +3137,14 @@ def run_main():
     ap.add_argument("--facebook", action="store_true", help="enable Facebook Marketplace scraping")
     ap.add_argument("--fb-endpoint", choices=["search","category","both"], default="both",
                     help="Facebook: use search, category feed, or both")
+
+    # Craigslist
+    ap.add_argument("--craigslist", action="store_true", help="enable Craigslist scraping")
+    ap.add_argument("--cl-zip", type=str, default=None, help="Craigslist ZIP code for proximity search")
+    ap.add_argument("--cl-radius", type=int, default=50, help="Craigslist search radius in miles")
+    ap.add_argument("--cl-site", type=str, default=None, help="Craigslist site subdomain (e.g., dallas). Optional")
+    ap.add_argument("--cl-endpoint", choices=["mca","search","both"], default="mca",
+                    help="Craigslist surface: motorcycles category (mca), general search, or both")
 
     # NADA modes
     ap.add_argument("--nada", action="store_true", help="enable NADA lookups")
@@ -2905,6 +3307,14 @@ def run_main():
 
     try:
         if args.login_fb:
+            # Ensure open network (no allowlist) and prefer headful for manual login
+            mgr.allow_domains = set()
+            if bool(args.headless):
+                try:
+                    LOG.info("--login-fb requested in headless mode; switching to headful for interactive login…")
+                    mgr.stop(); mgr.headless = False; mgr.start()
+                except Exception:
+                    pass
             ensure_facebook_login(mgr, args.fb_login_mode, args.fb_wait_login_seconds); return
 
         # KBB: quick list-and-exit for a single year/make
@@ -2953,7 +3363,7 @@ def run_main():
             return
 
         # Marketplaces need full network (drop allowlist)
-        if args.offerup or args.facebook:
+        if args.offerup or args.facebook or getattr(args, "craigslist", False):
             mgr.allow_domains = set()
 
         notified_urls: set = set()
@@ -2981,6 +3391,19 @@ def run_main():
                 LOG.info("Scraping Facebook…")
                 try: listings += scrape_facebook(mgr, args.price_min, args.price_max, args.fb_endpoint, seen_index, notified_urls, exclude_parts=(not args.include_parts))
                 except Exception as e: LOG.warning(f"Facebook scraping failed: {e}")
+            if getattr(args, "craigslist", False):
+                if not args.cl_zip:
+                    LOG.warning("Craigslist: --cl-zip is required; skipping")
+                else:
+                    LOG.info("Scraping Craigslist…")
+                    try:
+                        listings += scrape_craigslist(
+                            mgr, args.price_min, args.price_max,
+                            str(args.cl_zip), int(args.cl_radius or 50), args.cl_site, args.cl_endpoint,
+                            seen_index, notified_urls, exclude_parts=(not args.include_parts)
+                        )
+                    except Exception as e:
+                        LOG.warning(f"Craigslist scraping failed: {e}")
 
             if not listings:
                 LOG.info("No listings found."); return
